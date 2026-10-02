@@ -24,6 +24,17 @@ python3 app.py --db pharmacovigilance.db
 - `POST /api/cases/{id}/merge`：全局管理员合并重复案例。
 - `POST /api/escalate-overdue`、`GET /api/overdue`：逾期检查与升级。
 
+### 渠道来源历史对账
+
+渠道来源常晚于随访补录。为避免用旧严重性覆盖已经提交的国家报告，补录与对账遵循以下规则：
+
+- `POST /api/cases/{id}/sources`：补录一条渠道来源。必须带 `received_at`（**原始接收时间**）、`expected_revision`（**所基于的案例修订号**）、`serious`/`fatal`（严重性口径）和 `dedupe_key`。
+- 案例当前应采用的严重性按**版本号 + 时间**在时间线上定位：随访（`followup`）与医学裁定（`medical_review`）权威性高于渠道来源。锚定旧修订号的迟到来源只入历史并标记 `superseded`，不会覆盖随访或医学裁定后的当前结论。
+- 当迟到来源改变严重性口径且成为当前依据时：**未提交**的报告立即按新依据重算期限（`report_impact.recomputed`）；**已提交**的报告原样保留（`archived=1`，不再可提交），并生成版本号 +1 的新报告，状态为 `resubmission_required`（`report_impact.resubmitted`），新报告提交后才是当前有效版本。
+- 两人同时补录同一修订号时，只有修订号匹配并先提交者生效；另一人收到 `409 revision_conflict` 且其来源不落库。实现上以每案例进程内互斥锁 + 全新数据库连接 + 提交时条件更新三重保证。
+- `POST /api/sources/batch`：批量补录，`items` 每项含 `case_id`。各项独立提交，单项失败不影响其他项；失败后用相同 `dedupe_key` 重试只补未处理来源，已确认来源返回 `idempotent` 且不重复计数。返回 `applied/superseded/duplicated/conflicted/failed` 计数。
+- `GET /api/cases/{id}/reconcile`：三方对账，交叉核对案例当前严重性/接收时间/期限、来源历史（`applied` 与 `superseded`）以及每个国家的有效/归档报告版本。全部对得上时 `consistent=true`，否则在 `mismatches` 中列出具体不一致项，用于判断哪份报告有效。
+
 ## 测试
 
 ```bash
