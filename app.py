@@ -126,7 +126,30 @@ class Repository:
                 submitted_at TEXT,
                 submitted_by TEXT,
                 late INTEGER NOT NULL DEFAULT 0,
+                original_due_at TEXT,
+                original_submitted_at TEXT,
+                original_submitted_by TEXT,
+                original_late INTEGER NOT NULL DEFAULT 0,
+                resubmission_reason TEXT,
                 UNIQUE(case_id, country)
+            );
+            CREATE TABLE IF NOT EXISTS source_backfills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES cases(id),
+                batch_id TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                source TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                case_revision INTEGER NOT NULL,
+                serious INTEGER NOT NULL,
+                fatal INTEGER NOT NULL,
+                causality TEXT,
+                severity_at_time TEXT NOT NULL,
+                effective INTEGER NOT NULL DEFAULT 1,
+                superseded_reason TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(case_id, batch_id, item_key)
             );
             CREATE TABLE IF NOT EXISTS medical_reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,6 +174,20 @@ class Repository:
             );
             """
         )
+        self._migrate(self.conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(reports)")}
+        additions = [
+            ("original_due_at", "TEXT"),
+            ("original_submitted_at", "TEXT"),
+            ("original_submitted_by", "TEXT"),
+            ("original_late", "INTEGER NOT NULL DEFAULT 0"),
+            ("resubmission_reason", "TEXT"),
+        ]
+        for name, ddl in additions:
+            if name not in cols:
+                conn.execute(f"ALTER TABLE reports ADD COLUMN {name} {ddl}")
 
     @staticmethod
     def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -239,6 +276,7 @@ class PharmacovigilanceService:
         return {
             "case": dict(case),
             "intakes": [dict(r) for r in conn.execute("SELECT id,source,dedupe_key,received_at,created_by,created_at FROM intakes WHERE case_id=? ORDER BY id", (case_id,))],
+            "sources": [dict(r) for r in conn.execute("SELECT * FROM source_backfills WHERE case_id=? ORDER BY id", (case_id,))],
             "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
             "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
             "reviews": [dict(r) for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY id", (case_id,))],
@@ -302,7 +340,6 @@ class PharmacovigilanceService:
         if fatal and not serious:
             raise ApiError(400, "invalid_severity", "死亡案例必须标记为严重")
         received = parse_time(body.get("received_at"))
-        due = report_deadline(received, serious, fatal)
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
             if case["status"] == "merged":
@@ -310,6 +347,7 @@ class PharmacovigilanceService:
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例版本已变化")
             revision = expected + 1
+            due = report_deadline(parse_time(case["received_at"]), serious, fatal)
             conn.execute(
                 """UPDATE cases SET serious=?,fatal=?,causality=?,report_due_at=?,revision=?,updated_at=? WHERE id=?""",
                 (int(serious), int(fatal), causality, iso(due), revision, iso(), case_id),
@@ -319,8 +357,236 @@ class PharmacovigilanceService:
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (case_id, expected, int(serious), int(fatal), causality, rationale, actor, iso()),
             )
+            self._reconcile_reports(conn, case_id, due, "medical_review_severity_change")
             Repository.audit(conn, case_id, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality})
             return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected}
+
+    @staticmethod
+    def _conclusion_cutoff(conn: sqlite3.Connection, case_id: int, case: sqlite3.Row) -> datetime:
+        """最新一次严重性结论（医学裁定、随访或首次录入）的时间，用于判断来源是否已被覆盖。"""
+        row = conn.execute(
+            """
+            SELECT MAX(t) AS mt FROM (
+                SELECT created_at AS t FROM medical_reviews WHERE case_id=?
+                UNION ALL
+                SELECT received_at AS t FROM followups WHERE case_id=?
+                UNION ALL
+                SELECT received_at AS t FROM cases WHERE id=?
+            )
+            """,
+            (case_id, case_id, case_id),
+        ).fetchone()
+        if row and row["mt"]:
+            return parse_time(row["mt"])
+        return parse_time(case["received_at"])
+
+    @staticmethod
+    def _intake_severity(intake_row: sqlite3.Row | None, case: sqlite3.Row) -> dict[str, Any]:
+        if intake_row and intake_row["payload_json"]:
+            try:
+                payload = json.loads(intake_row["payload_json"])
+                return {
+                    "serious": bool(payload.get("serious", False)),
+                    "fatal": bool(payload.get("fatal", False)),
+                    "causality": payload.get("causality"),
+                }
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {"serious": bool(case["serious"]), "fatal": bool(case["fatal"]), "causality": case["causality"]}
+
+    @staticmethod
+    def _severity_at_time(reviews: list[sqlite3.Row], intake_sev: dict[str, Any], at: datetime) -> dict[str, Any]:
+        """按版本号和时间定位该来源原始接收时应采用的严重性。"""
+        applicable = [r for r in reviews if parse_time(r["created_at"]) <= at]
+        if applicable:
+            r = applicable[-1]
+            return {"serious": bool(r["serious"]), "fatal": bool(r["fatal"]), "causality": r["causality"]}
+        return dict(intake_sev)
+
+    @staticmethod
+    def _reconcile_reports(conn: sqlite3.Connection, case_id: int, new_due: datetime, reason: str) -> None:
+        """严重性口径变化后重算各报告期限：未交立即重算，已交转待重报并保留原稿。"""
+        rows = conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
+        for r in rows:
+            if r["status"] == "submitted":
+                conn.execute(
+                    """
+                    UPDATE reports SET status='pending_resubmission', due_at=?,
+                        original_due_at=COALESCE(original_due_at, due_at),
+                        original_submitted_at=COALESCE(original_submitted_at, submitted_at),
+                        original_submitted_by=COALESCE(original_submitted_by, submitted_by),
+                        original_late=COALESCE(original_late, late),
+                        submitted_at=NULL, submitted_by=NULL, late=0,
+                        resubmission_reason=?
+                    WHERE id=?
+                    """,
+                    (iso(new_due), reason, r["id"]),
+                )
+            else:
+                new_status = r["status"]
+                if new_status == "overdue" and new_due >= utcnow():
+                    new_status = "pending"
+                conn.execute("UPDATE reports SET due_at=?, status=? WHERE id=?", (iso(new_due), new_status, r["id"]))
+
+    def backfill_sources(self, case_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"reporter", "regional_lead", "global_admin"}:
+            raise ApiError(403, "backfill_forbidden", "当前角色不能补录来源")
+        batch_id = str(body.get("batch_id", "")).strip()
+        if not batch_id:
+            raise ApiError(400, "batch_id_required", "batch_id 必填")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int):
+            raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        raw_items = body.get("sources")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ApiError(400, "sources_required", "sources 必须是非空数组")
+        items: list[dict[str, Any]] = []
+        for idx, raw in enumerate(raw_items):
+            if not isinstance(raw, dict):
+                raise ApiError(400, "invalid_source", "每个来源必须是 JSON 对象")
+            source = str(raw.get("source", "")).strip()
+            if not source:
+                raise ApiError(400, "source_required", "source 必填")
+            received = parse_time(raw.get("received_at"))
+            has_sev = "serious" in raw or "fatal" in raw
+            serious = bool(raw.get("serious", False))
+            fatal = bool(raw.get("fatal", False))
+            causality = str(raw.get("causality", "")).strip() or None
+            if fatal and not serious:
+                raise ApiError(400, "invalid_severity", "死亡案例必须标记为严重")
+            item_key = str(raw.get("item_key", "")).strip() or f"item-{idx}"
+            items.append({
+                "item_key": item_key, "source": source, "received": received,
+                "has_sev": has_sev, "serious": serious, "fatal": fatal, "causality": causality,
+            })
+        now = iso()
+        with self.repo.tx() as conn:
+            case = self._case(conn, case_id)
+            if not self.can_access(case, role, region):
+                raise ApiError(403, "backfill_forbidden", "无权补录该区域案例来源")
+            if case["status"] == "merged":
+                raise ApiError(409, "case_merged", "已合并案例不能补录")
+            existing_rows = conn.execute(
+                "SELECT * FROM source_backfills WHERE case_id=? AND batch_id=?",
+                (case_id, batch_id),
+            ).fetchall()
+            existing = {r["item_key"]: r for r in existing_rows}
+            all_confirmed = len(existing) == len(items) and all(it["item_key"] in existing for it in items)
+            if all_confirmed:
+                return {
+                    "idempotent": True,
+                    "batch_id": batch_id,
+                    "sources": [dict(existing[it["item_key"]]) for it in items],
+                    "case": dict(case),
+                }
+            if case["revision"] != expected:
+                raise ApiError(409, "revision_conflict", "案例已被其他人员更新，请重新读取后补录")
+            reviews = conn.execute(
+                "SELECT * FROM medical_reviews WHERE case_id=? ORDER BY case_revision", (case_id,)
+            ).fetchall()
+            cutoff = self._conclusion_cutoff(conn, case_id, case)
+            intake_row = conn.execute(
+                "SELECT payload_json FROM intakes WHERE case_id=? ORDER BY id LIMIT 1", (case_id,)
+            ).fetchone()
+            intake_sev = self._intake_severity(intake_row, case)
+            results: list[dict[str, Any]] = []
+            new_rows: list[tuple[dict[str, Any], sqlite3.Row]] = []
+            for it in items:
+                if it["item_key"] in existing:
+                    results.append({
+                        "item_key": it["item_key"], "status": "already_confirmed",
+                        "backfill": dict(existing[it["item_key"]]),
+                    })
+                    continue
+                superseded = it["received"] < cutoff
+                sev_at = self._severity_at_time(reviews, intake_sev, it["received"])
+                effective = 0 if superseded else 1
+                cur = conn.execute(
+                    """
+                    INSERT INTO source_backfills(case_id,batch_id,item_key,source,received_at,case_revision,
+                       serious,fatal,causality,severity_at_time,effective,superseded_reason,created_by,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (case_id, batch_id, it["item_key"], it["source"], iso(it["received"]), expected,
+                     int(it["serious"]), int(it["fatal"]), it["causality"],
+                     json.dumps(sev_at, ensure_ascii=False, sort_keys=True), effective,
+                     "superseded_by_later_conclusion" if superseded else None, actor, now),
+                )
+                row = conn.execute("SELECT * FROM source_backfills WHERE id=?", (cur.lastrowid,)).fetchone()
+                new_rows.append((it, row))
+                results.append({
+                    "item_key": it["item_key"], "status": "confirmed",
+                    "effective": bool(effective), "backfill": dict(row),
+                })
+            current_sev = (bool(case["serious"]), bool(case["fatal"]))
+            candidates = [it for it, _row in new_rows if it["has_sev"] and not (it["received"] < cutoff)]
+            changed = False
+            if candidates:
+                latest = max(candidates, key=lambda x: x["received"])
+                if (latest["serious"], latest["fatal"]) != current_sev:
+                    new_serious, new_fatal = latest["serious"], latest["fatal"]
+                    new_due = report_deadline(parse_time(case["received_at"]), new_serious, new_fatal)
+                    revision = case["revision"] + 1
+                    conn.execute(
+                        "UPDATE cases SET serious=?,fatal=?,report_due_at=?,revision=?,updated_at=? WHERE id=?",
+                        (int(new_serious), int(new_fatal), iso(new_due), revision, iso(), case_id),
+                    )
+                    self._reconcile_reports(conn, case_id, new_due, "late_source_severity_change")
+                    Repository.audit(
+                        conn, case_id, actor, role, "severity_reconciled_from_sources",
+                        {"batch_id": batch_id, "from": list(current_sev), "to": [new_serious, new_fatal],
+                         "revision": revision},
+                    )
+                    changed = True
+            if not changed:
+                revision = case["revision"] + 1
+                conn.execute("UPDATE cases SET revision=?,updated_at=? WHERE id=?", (revision, iso(), case_id))
+            for it, row in new_rows:
+                Repository.audit(
+                    conn, case_id, actor, role, "source_backfilled",
+                    {"batch_id": batch_id, "item_key": it["item_key"], "source": it["source"],
+                     "received_at": iso(it["received"]), "effective": bool(row["effective"]),
+                     "case_revision": expected},
+                )
+            return {
+                "idempotent": False,
+                "batch_id": batch_id,
+                "sources": results,
+                "severity_changed": changed,
+                "case": dict(self._case(conn, case_id)),
+            }
+
+    def reconcile_case(self, case_id: int, role: str, region: str) -> dict[str, Any]:
+        case = self._case(self.repo.conn, case_id)
+        if not self.can_access(case, role, region):
+            raise ApiError(403, "case_forbidden", "无权查看该区域案例")
+        expected_due = report_deadline(parse_time(case["received_at"]), bool(case["serious"]), bool(case["fatal"]))
+        reports = [dict(r) for r in self.repo.conn.execute(
+            "SELECT * FROM reports WHERE case_id=? ORDER BY id", (case_id,)
+        )]
+        discrepancies: list[dict[str, Any]] = []
+        for r in reports:
+            if r["status"] == "submitted":
+                if not r["original_due_at"]:
+                    discrepancies.append({"report_id": r["id"], "issue": "submitted_report_missing_original"})
+            elif parse_time(r["due_at"]) != expected_due:
+                discrepancies.append({
+                    "report_id": r["id"], "issue": "due_mismatch",
+                    "expected": iso(expected_due), "actual": r["due_at"],
+                })
+        if parse_time(case["report_due_at"]) != expected_due:
+            discrepancies.append({
+                "issue": "case_due_mismatch",
+                "expected": iso(expected_due), "actual": case["report_due_at"],
+            })
+        return {
+            "case_id": case_id,
+            "reconciled": not discrepancies,
+            "case_due_at": case["report_due_at"],
+            "expected_due_at": iso(expected_due),
+            "reports": reports,
+            "discrepancies": discrepancies,
+        }
 
     def create_report(self, case_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"regional_lead", "global_admin"}:
@@ -440,6 +706,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
+        if len(parts) == 4 and parts[:2] == ["api", "cases"] and parts[2].isdigit() and parts[3] == "reconcile":
+            return 200, self.service.reconcile_case(int(parts[2]), role, region)
         raise ApiError(404, "not_found", "接口不存在")
 
     def _dispatch_post(self, path: str, body: dict[str, Any]) -> Any:
@@ -459,6 +727,9 @@ class Handler(BaseHTTPRequestHandler):
                 return 201, self.service.create_report(case_id, actor, role, region, body)
             if action == "merge":
                 return 200, self.service.merge_cases(case_id, actor, role, body)
+        if (len(parts) == 5 and parts[:2] == ["api", "cases"] and parts[2].isdigit()
+                and parts[3] == "sources" and parts[4] == "backfill"):
+            return 201, self.service.backfill_sources(int(parts[2]), actor, role, region, body)
         if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "submit":
             return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
         raise ApiError(404, "not_found", "接口不存在")
